@@ -19,8 +19,9 @@ started, a short plain-English summary of it, and the CPU and memory it uses.
 - **Where it runs.** The app it runs in (T3 Code, a terminal, VS Code, Zed, tmux,
   ...), its project folder, and how long it has been running. For agents started
   by T3 Code, the T3 thread title is shown instead of the folder.
-- **Each command.** A short summary such as "Running Rust tests" or
-  "Searching files", its age, CPU and memory. Finished commands stay for 20
+- **Each command.** A short summary of what is running right now, such as
+  "Running Rust tests" or "Installing packages · pacman", with the program's
+  name when the summary doesn't already say it, plus its age, CPU and memory. Finished commands stay for 20
   seconds, ticked and dimmed. Background jobs that outlive the shell that
   started them are still credited to the right Claude Code session.
 - **MCP servers** the agent keeps running, on one line.

@@ -131,6 +131,7 @@ def redact(text):
 # --------------------------------------------------------------------------
 _CLAUDE_EVAL = re.compile(r"\beval '((?:[^']|'\"'\"')*)'")
 _SKIP_WORDS = {"sudo", "env", "nice", "ionice", "time", "command", "exec", "builtin", "nohup", "stdbuf"}
+_WRAPPERS = _SKIP_WORDS | {"timeout"}       # programs whose job is to run another program
 _SETUP = re.compile(r"^(?:cd|export|source|\.|set|shopt|unset|unalias|trap|true|:|local|declare|ulimit|umask|pushd|popd|eval)$")
 
 
@@ -268,6 +269,13 @@ def _host(s):
         s = re.split(r"[/?#]", s.split("://", 1)[1], maxsplit=1)[0]
     s = s.rpartition("@")[2].partition(":")[0].lower()
     return s if _HOST_OK.fullmatch(s) else ""
+
+
+def proc_label(text, prog):
+    """The program's name for the row, or "" if the summary already says it."""
+    name = _name(prog)
+    stem = re.sub(r"[\d.]+$", "", name).lower() or name.lower()
+    return "" if not name or stem in text.lower() else redact(name)[:24]
 
 
 def _running(s, generic):
@@ -596,6 +604,18 @@ class Scanner:
         return ("--chrome-native-host" in a or a[1:3] == ["app-server", "daemon"]
                 or any(i < len(a) and a[i] in ("mcp", "mcp-server") for i in at))
 
+    def current(self, pid, procs, children, agents):
+        """The process a task is running right now: follow shells and wrappers
+        (sudo, timeout, ...) down to the command they are waiting on. A script
+        is summarised from its first command, which may have finished long ago."""
+        for _ in range(6):
+            a = self.args((pid, procs[pid][3]))
+            kids = [k for k in children.get(pid, ()) if k not in agents]
+            if not kids or not a or not (unwrap_shell(a) is not None or _base(a[0]) in _WRAPPERS):
+                break
+            pid = min(kids, key=lambda k: (procs[k][3], k))     # oldest: the first command of a pipeline
+        return pid
+
     def agent_name(self, key, comm):
         base = comm.lower()
         if base in AGENTS:
@@ -744,6 +764,14 @@ class Scanner:
                 if kind == "mcp":
                     mcps.append(text)
                     continue
+                cur = self.current(c, procs, children, agents)
+                cargs = self.args(key(cur)) or [procs[cur][0]]
+                if cur != c:
+                    if key(cur) not in self.desc:
+                        self.desc[key(cur)] = ("task", describe(cargs))
+                    text = self.desc[key(cur)][1]
+                # a shell between two commands has no program to name
+                prog = "" if unwrap_shell(cargs) is not None else proc_label(text, cargs[0])
                 t_cpu, t_rss, t_n = subtree(c, stop)
                 if c in orphans:
                     a_cpu += t_cpu
@@ -751,6 +779,7 @@ class Scanner:
                 task = {
                     "id": f"{c}-{procs[c][3]}",
                     "text": text,
+                    "proc": prog,
                     "started": int(BOOT + procs[c][3] / CLK),
                     "cpu": round(t_cpu, 1),
                     "mem": t_rss // (1024 * 1024),

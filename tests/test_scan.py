@@ -299,6 +299,31 @@ class Sessions(unittest.TestCase):
         self.assertEqual(scan.mcp_name(["/opt/tools/foo-mcp/bin/server", "--stdio"]), "foo")
 
 
+class RunningNow(unittest.TestCase):
+    def test_follows_shells_and_wrappers_to_the_live_command(self):
+        # 10 claude's shell -> 11 sudo -> 12 bash -c -> 13 pacman, and 14 a later pipeline stage
+        s = scan.Scanner()
+        argv = {10: claude("ls -la /x | cut -c1-30; sudo -S bash -c \"pacman -S fwupd\""), 11: ["sudo", "-S", "bash", "-c", "pacman -S fwupd"],
+                12: ["bash", "-c", "pacman -S fwupd; echo ok"], 13: ["pacman", "-S", "fwupd"], 14: ["tail", "-3"],
+                20: ["bash", "build.sh"], 21: ["make"]}
+        procs = {p: ("x", 0, 0, p, 0) for p in argv}
+        for p, a in argv.items():
+            s.cmd[(p, p)] = a
+        children = {10: [11], 11: [12], 12: [14, 13], 20: [21]}
+        self.assertEqual(scan.describe(argv[10]), "Looking at files")       # the script's first command
+        self.assertEqual(s.current(10, procs, children, {}), 13)
+        self.assertEqual(scan.describe(argv[13]), "Installing packages")
+        self.assertEqual(s.current(10, procs, {10: [11]}, {}), 11)           # sudo waiting for a password
+        self.assertEqual(s.current(20, procs, children, {}), 20)             # a script file keeps its own name
+        self.assertEqual(s.current(10, procs, {10: [11]}, {11: "Codex"}), 10)   # a nested agent has its own row
+
+    def test_program_name_shown_unless_summary_says_it(self):
+        for text, prog, want in [("Installing packages", "/usr/bin/pacman", "pacman"), ("Reading files", "jq", "jq"),
+                                 ("Git status", "git", ""), ("Python script", "python3.13", ""), ("Running sudo", "sudo", ""),
+                                 ("Running scan.py", "python3", "python3"), ("Shell", "-bash", ""), ("Running a program", "tok=hunter2", "")]:
+            self.assertEqual(scan.proc_label(text, prog), want, (text, prog))
+
+
 class MainLoop(unittest.TestCase):
     def test_survives_scan_errors(self):
         class Broken:

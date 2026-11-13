@@ -263,7 +263,7 @@ Panel {
 
     PlainText {
       Layout.fillWidth: true
-      text: row.task.text || ""
+      text: (row.task.text || "") + (row.task.proc ? " · " + row.task.proc : "")
       color: root.foreground
       font.pixelSize: Style.font.bodySmall
       elide: Text.ElideRight
