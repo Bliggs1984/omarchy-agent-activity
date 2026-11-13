@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Agent Activity scanner for the Omarchy bar.
+"""Agent Top scanner for the Omarchy bar.
 
 Finds AI coding agents (Claude Code, Codex, Gemini CLI, ...) in /proc, works
 out which processes each one started, describes those in plain English, and

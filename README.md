@@ -1,10 +1,10 @@
-# Agent Activity
+# Agent Top
 
 An Omarchy bar widget that shows what your AI coding agents are doing on your
 machine right now: which agents are running, every command each one has
 started, a short plain-English summary of it, and the CPU and memory it uses.
 
-![Agent Activity panel](preview.png)
+![Agent Top panel](preview.png)
 
 ## What it shows
 
