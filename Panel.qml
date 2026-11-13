@@ -8,7 +8,7 @@ import qs.Commons as Commons
 import qs.Ui
 import "Model.js" as Model
 
-// Agent Activity: which AI agents are running, what each one has started,
+// Agent Top: which AI agents are running, what each one has started,
 // and what it costs. All the work happens in scan.py; this file only draws.
 Panel {
   id: root
@@ -112,7 +112,7 @@ Panel {
 
           PanelHero {
             width: parent.width
-            title: "Agent activity"
+            title: "Agent Top"
             meta: root.agents.length === 0
               ? "No agents running"
               : root.agents.length + (root.agents.length === 1 ? " agent · " : " agents · ")

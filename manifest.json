@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
   "id": "io.github.bliggs1984.agent-activity",
-  "name": "Agent Activity",
-  "version": "1.0.0",
+  "name": "Agent Top",
+  "version": "1.1.0",
   "author": "Bliggs1984",
   "license": "MIT",
   "description": "Live view of the processes your AI agents have started: what each one is doing, which agent and session started it, and the CPU and memory it uses.",
@@ -11,10 +11,10 @@
     "barWidget": "Panel.qml"
   },
   "barWidget": {
-    "displayName": "Agent Activity",
+    "displayName": "Agent Top",
     "description": "One bar icon with a count of running agent tasks, and a panel listing each agent, its session, and every command it is running.",
     "category": "AI",
-    "aliases": ["agent-activity", "agent-processes"],
+    "aliases": ["agent-top", "agent-activity", "agent-processes"],
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
