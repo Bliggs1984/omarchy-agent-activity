@@ -42,6 +42,7 @@ AGENTS = {
     "gemini": "Gemini CLI",
     "opencode": "OpenCode",
     "kimi": "Kimi Code",
+    "kimi-code": "Kimi Code",     # sets its process title, so comm and cmdline are just this
     "aider": "Aider",
     "goose": "Goose",
     "crush": "Crush",
@@ -54,6 +55,28 @@ AGENTS = {
 }
 LAUNCHERS = {"node", "bun", "deno", "python", "python3", "MainThread"}
 SHELLS = {"sh", "bash", "zsh", "dash", "fish", "ash"}
+
+
+def is_launcher(comm):
+    # Node 23-25 name the main thread "MainThread", Node 26 "node-MainThread"
+    return comm in LAUNCHERS or comm.startswith("python") or comm.endswith("MainThread")
+
+
+def fold_agents(agents, parent):
+    """Agents started directly by an agent of the same name, mapped to the top
+    of that chain. Gemini and Qwen relaunch themselves, npm installs wrap a
+    native binary in a node script, OpenCode starts its own server: one session,
+    so one row. Only a direct parent counts: an agent that another session
+    started through a shell is a session of its own."""
+    out = {}
+    for pid, name in agents.items():
+        root, hops = pid, 0
+        while agents.get(parent.get(root)) == name and hops < 8:
+            root, hops = parent[root], hops + 1
+        if root != pid:
+            out[pid] = root
+    return out
+
 
 HOSTS = [  # ancestor comm prefix -> host app label
     ("t3code", "T3 Code"), ("T3-Code", "T3 Code"), ("code", "VS Code"),
@@ -69,13 +92,19 @@ HOSTS = [  # ancestor comm prefix -> host app label
 # Secret masking. Everything that reaches the panel goes through here.
 # --------------------------------------------------------------------------
 _SECRET_NAME = r"[A-Za-z0-9_\-]*(?:pass(?:word|wd)?|secret|token|api[_\-]?key|apikey|auth|credential|private[_\-]?key|access[_\-]?key|session)[A-Za-z0-9_\-]*"
+# A name starts only where no name character precedes it. With a plain \b each
+# position inside "a-a-a-..." was a new start, which made matching quadratic.
+_NB = r"(?<![A-Za-z0-9_\-])"
 _REDACTIONS = [
-    # NAME=value, --name=value, --name value, "name": "value", name: value
-    re.compile(r"(?i)(\b" + _SECRET_NAME + r"\b[\"']?\s*(?:=|:|\s)\s*[\"']?)([^\s\"'&;|]+)"),
+    # NAME=value, --name=value, "name": "value", name: value. A plain space after
+    # an ordinary word ("Remote session on host") is not a separator.
+    re.compile(r"(?i)" + _NB + "(" + _SECRET_NAME + r"[\"']?\s*[=:]\s*[\"']?)([^\s\"'&;|]+)"),
     # Authorization headers
     re.compile(r"(?i)(authorization:\s*(?:bearer|basic|token)?\s*)(\S+)"),
     # user:password@ in URLs
     re.compile(r"(://[^/\s:@]+:)([^@\s/]+)(@)"),
+    # --name value, -name value (the value may not itself be an option)
+    re.compile(r"(?i)" + _NB + r"(-{1,2}" + _SECRET_NAME + r"\s+[\"']?)([^\s\"'&;|\-][^\s\"'&;|]*)"),
 ]
 _TOKEN_SHAPES = re.compile(
     r"\b(?:sk-[A-Za-z0-9_\-]{12,}|sk-ant-[A-Za-z0-9_\-]{12,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
@@ -84,11 +113,15 @@ _TOKEN_SHAPES = re.compile(
 
 
 def redact(text):
+    """Mask secrets. Cuts to 256 characters first; callers cut to display length
+    afterwards (cutting short before masking could leave a key's prefix bare)."""
     if not text:
         return text
+    text = text[:256]
     text = _TOKEN_SHAPES.sub("•••", text)
     text = _REDACTIONS[1].sub(lambda m: m.group(1) + "•••", text)   # headers before the generic rule
     text = _REDACTIONS[0].sub(lambda m: m.group(1) + "•••", text)
+    text = _REDACTIONS[3].sub(lambda m: m.group(1) + "•••", text)
     text = _REDACTIONS[2].sub(lambda m: m.group(1) + "•••" + m.group(3), text)
     return text
 
@@ -108,14 +141,30 @@ def unwrap_shell(args, depth=0):
     prog = os.path.basename(args[0])
     if prog not in SHELLS:
         return None
-    for i, a in enumerate(args[1:], 1):
-        if a in ("-c", "-lc", "-ic", "-cl") and i + 1 < len(args):
-            script = args[i + 1][:MAX_CMD]
-            m = _CLAUDE_EVAL.search(script)          # Claude Code's Bash tool
-            if m:
-                return m.group(1).replace("'\"'\"'", "'")
-            return script
-    return None
+    # Options come first: -c alone or in a bundle (-ec, -ilc), -o/-O with a value
+    # (also at the end of a bundle: -euo pipefail), long options (--norc).
+    # The script is the first argument after them.
+    i, c = 1, False
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            i += 1
+            break
+        if a[:1] in "-+" and a[1:].isalpha():
+            c = c or a[0] == "-" and "c" in a
+            i += 2 if a[-1] in "oO" else 1
+            continue
+        if a.startswith("--"):
+            i += 1
+            continue
+        break
+    if not c or i >= len(args):
+        return None
+    script = args[i][:MAX_CMD]
+    m = _CLAUDE_EVAL.search(script)          # Claude Code's Bash tool
+    if m:
+        return m.group(1).replace("'\"'\"'", "'")
+    return script
 
 
 def split_commands(script):
@@ -196,6 +245,36 @@ def _base(p):
     return os.path.basename(p.rstrip("/")) or p
 
 
+# Display guard: an argument is pasted into a summary only if it has a safe
+# shape; otherwise it is dropped and the generic label is used.
+_SUB_OK = re.compile(r"[a-z][a-z0-9:._-]{0,24}")                    # subcommands
+_NAME_OK = re.compile(r"[A-Za-z0-9_@][A-Za-z0-9._:@+-]{0,39}")       # script, program, package names
+_HOST_OK = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,61}[A-Za-z0-9])?")
+
+
+def _sub(s, before=" "):
+    return before + s if _SUB_OK.fullmatch(s) else ""
+
+
+def _name(s):
+    b = _base(s) if s else ""
+    return b if _NAME_OK.fullmatch(b) else ""
+
+
+def _host(s):
+    """Host of a URL or of ssh's [user@]host[:path], or "" if it looks odd.
+    By hand: urllib.parse would add almost 1 MB to the scanner."""
+    if "://" in s:
+        s = re.split(r"[/?#]", s.split("://", 1)[1], maxsplit=1)[0]
+    s = s.rpartition("@")[2].partition(":")[0].lower()
+    return s if _HOST_OK.fullmatch(s) else ""
+
+
+def _running(s, generic):
+    n = _name(s)
+    return "Running " + n if n else generic
+
+
 def describe_words(w):
     if not w:
         return None
@@ -205,43 +284,44 @@ def describe_words(w):
         inner = unwrap_shell(w)
         if inner:
             return describe_script(inner)
-        if sub:
-            return "Running " + _base(sub)
-        return "Shell"
+        return _running(sub, "Shell")
     if _SETUP.match(prog) or prog in ("echo", "printf", "sleep", "wait", "test", "[", "[[", "read"):
         return {"sleep": "Waiting", "wait": "Waiting for jobs"}.get(prog)
     if prog == "git":
-        return "Git " + sub if sub else "Git"
+        return "Git" + _sub(sub)
     if prog == "gh":
-        return ("GitHub " + " ".join(a for a in w[1:3] if not a.startswith("-"))).strip()
+        return "GitHub" + "".join(_sub(a) for a in w[1:3] if not a.startswith("-"))
     if prog == "cargo":
         return {"test": "Running Rust tests", "build": "Building Rust project", "run": "Running Rust program",
-                "check": "Checking Rust code", "clippy": "Linting Rust code", "fmt": "Formatting Rust code"}.get(sub, "Cargo " + sub)
+                "check": "Checking Rust code", "clippy": "Linting Rust code", "fmt": "Formatting Rust code"}.get(sub, "Cargo" + _sub(sub))
     if prog in ("npm", "pnpm", "yarn", "bun"):
         if sub in ("run", "run-script"):
-            return prog + " run " + _arg(w, 2)
+            n = _name(_arg(w, 2))
+            return prog + " run" + (" " + n if n else "")
         if sub in ("test", "t"):
             return "Running JS tests"
         if sub in ("install", "i", "add", "ci"):
             return "Installing packages"
         if sub in ("x", "exec", "dlx") or prog == "bun" and sub.endswith((".ts", ".js")):
-            return "Running " + _base(_arg(w, 2) or sub)
-        return prog + " " + sub if sub else prog
+            return _running(_arg(w, 2) or sub, prog)
+        return prog + _sub(sub)
     if prog in ("npx", "bunx", "uvx", "pnpx"):
-        return "Running " + _base(sub) if sub else prog
+        return _running(sub, prog)
     if prog.startswith("python") or prog in ("node", "deno", "ruby", "perl", "php"):
+        generic = {"node": "Node script", "deno": "Deno script"}.get(prog, "Python script" if prog.startswith("python") else prog + " script")
         if "-m" in w:
             mod = w[w.index("-m") + 1] if w.index("-m") + 1 < len(w) else ""
-            return {"pytest": "Running Python tests", "pip": "Installing packages", "http.server": "Serving files"}.get(mod, "Running " + mod)
+            return {"pytest": "Running Python tests", "pip": "Installing packages", "http.server": "Serving files"}.get(mod) or _running(mod, generic)
         if "-c" in w or "-e" in w or "--eval" in w or not sub or sub.startswith("$"):
-            return {"node": "Node script", "deno": "Deno script"}.get(prog, "Python script" if prog.startswith("python") else prog + " script")
-        return "Running " + _base(sub)
+            return generic
+        return _running(sub, generic)
     if prog in ("pytest", "jest", "vitest", "mocha", "rspec"):
         return "Running tests"
     if prog in ("go",):
-        return {"test": "Running Go tests", "build": "Building Go project", "run": "Running Go program"}.get(sub, "Go " + sub)
+        return {"test": "Running Go tests", "build": "Building Go project", "run": "Running Go program"}.get(sub, "Go" + _sub(sub))
     if prog in ("make", "cmake", "ninja", "meson", "qmake6", "qmake", "gcc", "g++", "clang", "rustc", "tsc"):
-        return "Building" + (" " + sub if prog == "make" and sub else "")
+        n = _name(sub) if prog == "make" else ""
+        return "Building" + (" " + n if n else "")
     if prog in ("grep", "rg", "ag", "ack", "egrep"):
         return "Searching files"
     if prog in ("find", "fd", "locate", "ls", "tree", "du", "stat"):
@@ -253,21 +333,21 @@ def describe_words(w):
     if prog in ("cp", "mv", "rm", "mkdir", "touch", "chmod", "ln", "tee", "install", "rsync"):
         return {"rm": "Deleting files", "rsync": "Syncing files"}.get(prog, "Changing files")
     if prog in ("curl", "wget", "http", "xh"):
-        url = next((a for a in w[1:] if "://" in a), "")
-        host = re.sub(r"^\w+://([^/:]+).*", r"\1", url) if url else ""
+        host = _host(next((a for a in w[1:] if "://" in a), ""))
         return "Fetching " + host if host else "Downloading"
     if prog in ("ssh", "scp", "mosh"):
-        return "Remote session on " + re.sub(r"^.*@", "", sub) if sub else "Remote session"
+        host = _host(sub)
+        return "Remote session on " + host if host else "Remote session"
     if prog in ("docker", "podman"):
-        return "Docker " + sub if sub else "Docker"
+        return "Docker" + _sub(sub)
     if prog in ("pacman", "yay", "paru", "apt", "dnf", "brew", "pip", "pip3", "uv"):
-        return "Installing packages" if sub in ("-S", "install", "add", "sync", "pip") or "-S" in w else prog + " " + sub
+        return "Installing packages" if sub in ("-S", "install", "add", "sync", "pip") or "-S" in w else prog + _sub(sub)
     if prog in ("tar", "unzip", "zip", "gzip", "xz", "7z"):
         return "Unpacking files" if prog in ("unzip",) or "-x" in "".join(w[1:2]) else "Packing files"
     if prog in ("systemctl", "journalctl"):
         return "Checking services" if prog == "journalctl" or sub in ("status", "is-active", "list-units") else "Managing services"
     if prog in ("hyprctl", "omarchy", "qs", "quickshell"):
-        return prog.capitalize() + (" " + sub if sub else "")
+        return prog.capitalize() + _sub(sub)
     if prog in ("ps", "pgrep", "top", "btop", "htop", "free", "uptime", "lsof", "ss", "ip", "ping"):
         return "Checking the system"
     if prog in ("ffmpeg", "magick", "convert", "grim"):
@@ -276,20 +356,22 @@ def describe_words(w):
         return "Driving a browser"
     if prog in ("sqlite3", "psql", "mysql", "redis-cli"):
         return "Querying a database"
-    return "Running " + prog
+    return _running(prog, "Running a program")
+
+
+def real_commands(script):
+    """main_words of each command in a script, skipping setup like cd/export/echo."""
+    for cmd in split_commands(script[:MAX_CMD]):
+        w = main_words(cmd)
+        if w and not (_SETUP.match(_base(w[0])) or _base(w[0]) in ("echo", "printf", "test", "[", "[[", "true", "false", "read")):
+            yield w
 
 
 def describe_script(script):
     first_setup = None
-    for cmd in split_commands(script[:MAX_CMD]):
-        w = main_words(cmd)
-        if not w:
-            continue
-        prog = _base(w[0])
-        if prog == "sleep":
+    for w in real_commands(script):
+        if _base(w[0]) == "sleep":
             first_setup = first_setup or "Waiting"
-            continue
-        if _SETUP.match(prog) or prog in ("echo", "printf", "test", "[", "[[", "true", "false", "read"):
             continue
         d = describe_words(w)
         if d:
@@ -302,29 +384,90 @@ def describe(args):
         return "Process"
     script = unwrap_shell(args)
     if script is not None:
-        return redact(describe_script(script))
-    return redact(describe_words(main_words(" ".join(_quote(a) for a in args))) or "Running " + _base(args[0]))
+        return redact(describe_script(script))[:80]
+    d = describe_words(main_words(" ".join(_quote(a) for a in args))) or _running(args[0], "Running a program")
+    return redact(d)[:80]
 
 
 def _quote(a):
     return "'" + a + "'" if (not a or any(c.isspace() for c in a)) and "'" not in a else a
 
 
-_MCP = re.compile(r"(?i)(?:^|[/@\-_])mcp(?:$|[\-_/.@])|modelcontextprotocol|mcp-server|server-[a-z]+")
+# "mcp" as a whole word inside a path segment, or the official package scope
+_MCP = re.compile(r"(?i)(?:^|[/@\-_.])mcp(?:$|[/@\-_.])|modelcontextprotocol")
+_MCP_SUBS = ("mcp", "mcp-server", "start-mcp-server")
+_DOCKER_VALUE = ("-e", "--env", "-v", "--volume", "--name", "-p", "--network")
+_MCP_NAME_OK = re.compile(r"[A-Za-z0-9._@-]{1,24}")
+
+
+def _first_plain(w, i):
+    """Index of the first word at or after i that is not an option, or None."""
+    return next((j for j in range(i, len(w)) if not w[j].startswith("-")), None)
+
+
+def _script_at(w):
+    """Index of the script a node/bun/python launcher runs: the first argument
+    that is not an option, or python's -m module (python -W ignore -m aider)."""
+    i = _first_plain(w, 1)
+    if "-m" in w[1:-1] and _base(w[0]).startswith("python"):
+        m = w.index("-m", 1)
+        if i is None or m < i or not any("/" in a or a.endswith(".py") for a in w[1:m]):
+            return m + 1
+    return i
 
 
 def mcp_name(args):
-    """If this looks like an MCP server, return a short name for it."""
-    head = " ".join(args[:4])[:600]
-    if not _MCP.search(head) and "mcp" not in (os.path.basename(args[0]) if args else ""):
+    """If this looks like an MCP server, return a short name for it.
+
+    Only the program and, for launchers (npx, docker run, node, ...), the
+    package or script it runs are looked at, never the rest of the command."""
+    script = unwrap_shell(args)
+    if script is None:
+        w = args
+    else:
+        w = next((w for w in real_commands(script) if _base(w[0]) != "sleep"), None)
+    if not w:
         return None
-    parts = [seg for a in args[:6] for seg in reversed(a.rstrip("/").split("/"))]
-    for b in parts:
-        b = re.sub(r"\.(?:js|mjs|cjs|py|ts)$", "", b)
-        if re.search(r"(?i)mcp|server-", b):
-            b = re.sub(r"(?i)^(?:mcp[-_]server[-_]|server[-_]|mcp[-_])|(?:[-_]mcp(?:[-_]server)?)$", "", b)
-            return redact(b or "mcp")[:24]
-    return "mcp"
+    prog = _base(w[0])
+    pkg = None
+    if prog in ("npx", "bunx", "uvx", "pnpx"):
+        pkg = _first_plain(w, 1)
+    elif prog in ("docker", "podman") and w[1:2] == ["run"]:
+        i = 2
+        while i < len(w) and w[i].startswith("-"):
+            i += 2 if w[i] in _DOCKER_VALUE else 1
+        pkg = i if i < len(w) else None
+    elif prog in ("npm", "pnpm", "yarn", "bun", "uv") and w[1:2] and w[1] in ("exec", "x", "dlx", "run"):
+        pkg = _first_plain(w, 2)
+    elif prog == "uv" and w[1:3] == ["tool", "run"]:
+        pkg = _first_plain(w, 3)
+    elif script is None and (prog in ("node", "bun", "deno") or prog.startswith("python")):
+        # A direct child of the agent; a script run through the agent's shell is a task.
+        pkg = _script_at(w)
+    named = w[pkg] if pkg is not None else w[0]
+    # Through a shell only the program's name counts, not the folder it sits in
+    # (/home/u/my-mcp/node_modules/.bin/jest is a test run, not a server).
+    cand = [w[0] if script is None else prog] + ([named] if pkg is not None else [])
+    hit = next((c for c in cand if _MCP.search(c)), None)
+    if hit is not None:
+        segs = reversed(hit.rstrip("/").split("/"))
+        name = "mcp"
+        for b in segs:
+            b = re.sub(r"\.(?:js|mjs|cjs|py|ts)$", "", b)
+            if re.search(r"(?i)mcp|server-", b):
+                name = re.sub(r"(?i)^(?:mcp[-_]server[-_]|server[-_]|mcp[-_])|(?:[-_]mcp(?:[-_]server)?)$", "", b) or "mcp"
+                if name.lower() == "mcp":           # @playwright/mcp: use the scope
+                    scope = next(segs, "")
+                    name = scope[1:] if scope.startswith("@") and len(scope) > 1 else "mcp"
+                break
+    elif script is None and any(a in _MCP_SUBS for a in w[1:4]):
+        # "serena start-mcp-server", "codex mcp-server". Direct children only:
+        # in a shell command these are usually arguments ("grep -rn mcp-server").
+        name = re.sub(r"\.(?:js|mjs|cjs|py|ts)$", "", _base(named))
+    else:
+        return None
+    name = redact(name)[:24]
+    return name if _MCP_NAME_OK.fullmatch(name) else "mcp"
 
 
 # --------------------------------------------------------------------------
@@ -404,6 +547,7 @@ class Scanner:
         self.envc = {}          # (pid, start) -> env subset
         self.desc = {}          # (pid, start) -> description
         self.agent_info = {}    # (pid, start) -> dict(name, host, label, thread)
+        self.names = {}         # ((pid, start), comm) -> agent name or None, so each process is judged once
         self.titles = {}        # thread id -> (title, fetched_at)
         self.done = {}          # agent key -> list of (expires, task dict)
         self.seen_tasks = {}    # agent key -> {task key: task dict}
@@ -414,7 +558,7 @@ class Scanner:
             a = self.cmd[key] = read_cmdline(key[0])
         return a
 
-    def env(self, key, keys=("CLAUDE_PID", "T3CODE_THREAD_ID", "CODEX_THREAD_ID")):
+    def env(self, key, keys=("CLAUDE_PID", "T3CODE_THREAD_ID")):
         e = self.envc.get(key)
         if e is None:
             e = self.envc[key] = read_env(key[0], keys)
@@ -444,25 +588,39 @@ class Scanner:
         self.titles[tid] = (title, now)
         return title
 
+    @staticmethod
+    def helper(a, at):
+        # Helper modes of an agent binary (MCP server, browser bridge), not a session.
+        # Only the subcommand slot counts: "--mcp-config x" or "-p 'add an mcp tool'" are sessions.
+        # "codex app-server daemon ..." is the bookkeeping half of Codex's background service.
+        return ("--chrome-native-host" in a or a[1:3] == ["app-server", "daemon"]
+                or any(i < len(a) and a[i] in ("mcp", "mcp-server") for i in at))
+
     def agent_name(self, key, comm):
         base = comm.lower()
         if base in AGENTS:
             a = self.args(key)
-            joined = " ".join(a[1:4])
-            if "--chrome-native-host" in joined or re.search(r"\bmcp\b", joined):
-                return None
-            return AGENTS[base]
-        if comm in LAUNCHERS or comm.startswith("python"):
+            return None if self.helper(a, (1,)) else AGENTS[base]
+        if is_launcher(comm):
             a = self.args(key)
-            for s in a[1:3]:
-                b = os.path.basename(s).lower()
-                b = re.sub(r"\.(?:js|mjs|cjs|py)$", "", b)
-                if b in AGENTS:
-                    return AGENTS[b]
-                m = re.search(r"/(?:@[^/]+/)?(gemini-cli|claude-code|codex|opencode|qwen-code|copilot)(?:/|$)", s)
-                if m:
-                    return {"gemini-cli": "Gemini CLI", "claude-code": "Claude Code", "codex": "Codex",
-                            "opencode": "OpenCode", "qwen-code": "Qwen Code", "copilot": "Copilot CLI"}[m.group(1)]
+            if not a:
+                return None
+            # Candidates: the program itself (cursor-agent, copilot's native binary)
+            # and the script it runs. Later arguments are the agent's own options.
+            s = _script_at(a)
+            for j in (0, s):
+                if j is None:
+                    continue
+                b = re.sub(r"\.(?:js|mjs|cjs|py)$", "", os.path.basename(a[j]).lower())
+                name = AGENTS.get(b)
+                if not name:
+                    m = re.search(r"/(?:@[^/]+/)?(gemini-cli|claude-code|codex|opencode|qwen-code|copilot)(?:/|$)", a[j])
+                    name = m and {"gemini-cli": "Gemini CLI", "claude-code": "Claude Code", "codex": "Codex",
+                                  "opencode": "OpenCode", "qwen-code": "Qwen Code", "copilot": "Copilot CLI"}[m.group(1)]
+                if name:
+                    # the subcommand follows the script ([cursor-agent, --flag, index.js, mcp])
+                    at = (1,) if s is None else (s, s + 1) if j == 0 else (s + 1,)
+                    return None if self.helper(a, at) else name
         return None
 
     def scan(self):
@@ -494,10 +652,11 @@ class Scanner:
         # Agents
         agents = {}
         for pid, (comm, _, _, _, _) in procs.items():
-            if comm.lower() in AGENTS or comm in LAUNCHERS or comm.startswith("python"):
-                if not owned(pid):
-                    continue
-                n = self.agent_name(key(pid), comm)
+            if comm.lower() in AGENTS or is_launcher(comm):
+                nk = (key(pid), comm)       # comm is in the key: it changes when a process execs or renames itself
+                n = self.names.get(nk, 0)
+                if n == 0:
+                    n = self.names[nk] = self.agent_name(nk[0], comm) if owned(pid) else None
                 if n:
                     agents[pid] = n
 
@@ -506,8 +665,8 @@ class Scanner:
         live_claude = {pid for pid, n in agents.items() if n == "Claude Code"}
         if live_claude:
             for pid, (comm, ppid, _, _, _) in procs.items():
-                if pid in agents or ppid in procs and procs[ppid][0] not in ("systemd", "init"):
-                    continue
+                if pid in agents or comm.lower() in AGENTS or ppid in procs and procs[ppid][0] not in ("systemd", "init"):
+                    continue                          # agents, their helpers and daemons are not jobs
                 if ppid == 0 or pid == 1 or not owned(pid):
                     continue
                 cp = self.env(key(pid)).get("CLAUDE_PID", "")
@@ -528,10 +687,19 @@ class Scanner:
                         stack.append(c)
             return total_cpu, total_rss, n
 
+        # One row per session (see fold_agents). A folded agent's processes, tasks
+        # and orphans count under the agent at the top of its chain.
+        folded = fold_agents(agents, {p: procs[p][1] for p in agents})
+        members = {}
+        for c, r in folded.items():
+            members.setdefault(r, []).append(c)
+
         out_agents = []
-        stop = set(agents)
+        stop = set(agents) - set(folded)
         live_keys = set()
         for apid, aname in sorted(agents.items()):
+            if apid in folded:
+                continue
             akey = key(apid)
             live_keys.add(akey)
             info = self.agent_info.get(akey)
@@ -554,13 +722,15 @@ class Scanner:
                     "thread": self.env(akey).get("T3CODE_THREAD_ID", ""),
                 }
             label = self.thread_title(info["thread"]) if info["thread"] else None
-            label = redact(label or info["folder"] or "")
+            label = redact(label or info["folder"] or "")[:80]
 
             a_cpu, a_rss, _ = subtree(apid, stop - {apid})
             tasks, mcps = [], []
             seen = self.seen_tasks.setdefault(akey, {})
             current = set()
-            for c in children.get(apid, []) + adopted.get(apid, []):
+            own = [apid] + members.get(apid, [])
+            orphans = {c for m in own for c in adopted.get(m, ())}
+            for c in [c for m in own for c in children.get(m, ())] + sorted(orphans):
                 if c in agents or c not in procs:
                     continue
                 ckey = key(c)
@@ -575,7 +745,7 @@ class Scanner:
                     mcps.append(text)
                     continue
                 t_cpu, t_rss, t_n = subtree(c, stop)
-                if c in adopted.get(apid, []):
+                if c in orphans:
                     a_cpu += t_cpu
                     a_rss += t_rss
                 task = {
@@ -598,6 +768,8 @@ class Scanner:
                     t.update(cpu=0, mem=0, done=True, ended=int(now))
                     held.append((now + DONE_HOLD, t))
             self.done[akey] = held
+            if not tasks and not held and "--managed-daemon" in self.args(akey):
+                continue        # Codex's background service: a row only while it runs something
 
             tasks.sort(key=lambda t: (-t["cpu"], -t["started"]))
             shown = tasks[:MAX_TASKS_PER_AGENT]
@@ -620,6 +792,8 @@ class Scanner:
         for cache in (self.cmd, self.envc, self.desc, self.agent_info):
             for k in [k for k in cache if k not in alive]:
                 del cache[k]
+        for k in [k for k in self.names if k[0] not in alive]:
+            del self.names[k]
         for k in [k for k in self.seen_tasks if k not in live_keys]:
             del self.seen_tasks[k]
             self.done.pop(k, None)
@@ -650,8 +824,17 @@ def main():
     s = Scanner()
     interval = SLOW
     last = None
+    errors = set()
     while True:
-        snap = s.scan()
+        try:
+            snap = s.scan()
+        except Exception as e:      # keep going; an empty snapshot clears stale rows
+            err = f"{type(e).__name__}: {e}"[:300]
+            if err not in errors and len(errors) < 100:
+                errors.add(err)
+                sys.stderr.write("agent-activity: scan failed: " + err + "\n")
+                sys.stderr.flush()
+            snap = {"agents": [], "cpu": 0, "mem": 0, "busy": 0, "ncpu": NCPU}
         line = json.dumps(snap, separators=(",", ":"))
         if line != last:
             sys.stdout.write(line + "\n")
