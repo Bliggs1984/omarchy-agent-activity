@@ -247,35 +247,52 @@ Panel {
     }
   }
 
-  component TaskRow: RowLayout {
+  component TaskRow: ColumnLayout {
     id: row
     property var task: ({})
     property color tint: root.foreground
     readonly property bool done: task.done === true
-    spacing: Style.space(8)
+    spacing: 0
     opacity: done ? 0.5 : 1
 
-    PlainText {
-      text: row.done ? "✓" : "›"
-      color: row.done ? root.dim : row.tint
-      font.pixelSize: Style.font.bodySmall
-    }
-
-    PlainText {
+    RowLayout {
       Layout.fillWidth: true
-      text: (row.task.text || "") + (row.task.proc ? " · " + row.task.proc : "")
-      color: root.foreground
-      font.pixelSize: Style.font.bodySmall
-      elide: Text.ElideRight
+      spacing: Style.space(8)
+
+      PlainText {
+        id: marker
+        text: row.done ? "✓" : "›"
+        color: row.done ? root.dim : row.tint
+        font.pixelSize: Style.font.bodySmall
+      }
+
+      PlainText {
+        Layout.fillWidth: true
+        text: (row.task.text || "") + (row.task.proc ? " · " + row.task.proc : "")
+        color: root.foreground
+        font.pixelSize: Style.font.bodySmall
+        elide: Text.ElideRight
+      }
+
+      PlainText {
+        text: row.done ? "done" : Model.age(row.task.started, root.nowSec)
+        color: root.dim
+        font.pixelSize: Style.font.caption
+      }
+
+      Gauges { visible: !row.done; cpu: row.task.cpu; memMb: row.task.mem; color: row.tint; small: true }
     }
 
+    // What the task is running underneath, by program name only ("↳ encode.py › ffmpeg").
     PlainText {
-      text: row.done ? "done" : Model.age(row.task.started, root.nowSec)
+      visible: !row.done && !!row.task.chain
+      Layout.fillWidth: true
+      Layout.leftMargin: marker.width + Style.space(8)
+      text: "↳ " + (row.task.chain || "")
       color: root.dim
       font.pixelSize: Style.font.caption
+      elide: Text.ElideRight
     }
-
-    Gauges { visible: !row.done; cpu: row.task.cpu; memMb: row.task.mem; color: row.tint; small: true }
   }
 
   // A chip that fills from the bottom for CPU, and a memory stick whose four

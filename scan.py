@@ -31,6 +31,7 @@ NCPU = os.cpu_count() or 1
 MY_UID = os.getuid()
 FAST, SLOW = 2.0, 5.0
 DONE_HOLD = 20.0          # seconds a finished task stays on the panel
+HOLD = 10.0               # seconds a task's "↳" line stays after its work goes quiet
 MAX_TASKS_PER_AGENT = 8
 MAX_CMD = 8192            # longest command line we try to understand
 T3_DB = os.path.expanduser("~/.t3/userdata/statev2.sqlite")
@@ -276,6 +277,32 @@ def proc_label(text, prog):
     name = _name(prog)
     stem = re.sub(r"[\d.]+$", "", name).lower() or name.lower()
     return "" if not name or stem in text.lower() else redact(name)[:24]
+
+
+_SCRIPT_EXT = re.compile(r"\.(?:py|pyw|js|mjs|cjs|ts|mts|rb|pl|php|sh|bash)$", re.I)
+_HASH_TAIL = re.compile(r"-[0-9a-f]{6,}$")      # Rust test binaries: aiwidget-3f9c2e1b7a6d5c4e
+_INLINE = ("-c", "-e", "-p", "--eval", "--print", "-")
+
+
+def work_label(comm, args):
+    """One word for a process inside a task, for the "↳ encode.py › ffmpeg" line:
+    the script a shell or interpreter runs, otherwise the program's name. None for
+    a shell that runs no script file. A flag's value is never taken for a script."""
+    shell = comm in SHELLS
+    if shell or is_launcher(comm):
+        prev = args[0] if args else ""
+        for i, a in enumerate(args[1:], 1):
+            if a in _INLINE:
+                break
+            if a == "-m" and comm.startswith("python"):
+                module = args[i + 1] if i + 1 < len(args) else ""
+                return redact(_name(module))[:24] or None
+            if not a.startswith("-") and (_SCRIPT_EXT.search(a) or ("/" in a and not prev.startswith("-"))):
+                return redact(_name(a))[:24] or None
+            prev = a
+        if shell:
+            return None
+    return redact(_HASH_TAIL.sub("", _name(comm)))[:24] or None
 
 
 def _running(s, generic):
@@ -559,6 +586,7 @@ class Scanner:
         self.titles = {}        # thread id -> (title, fetched_at)
         self.done = {}          # agent key -> list of (expires, task dict)
         self.seen_tasks = {}    # agent key -> {task key: task dict}
+        self.workers = {}       # task key -> [worker key, chain, last busy time], see work_chain()
 
     def args(self, key):
         a = self.cmd.get(key)
@@ -615,6 +643,60 @@ class Scanner:
                 break
             pid = min(kids, key=lambda k: (procs[k][3], k))     # oldest: the first command of a pipeline
         return pid
+
+    def work_chain(self, c, cur, text, prog, procs, children, cpu, stop, now):
+        """The "↳ encode.py › ffmpeg" line under a task: the programs from the command
+        it is running now (cur) down to the busiest one using at least 1% CPU, by
+        name only. The process picked last time stays while it is at least half as
+        busy, and the line stays HOLD seconds after the work goes quiet, so it doesn't
+        flicker. Names the row already gives are left out; at most the last three."""
+        tkey = (c, procs[c][3])
+        prev = self.workers.get(tkey)
+        parent_of, best, kept = {}, None, None
+        stack = [(c, 0)]
+        while stack:
+            p, d = stack.pop()
+            st = procs.get(p)
+            if not st:
+                continue
+            if st[0] not in SHELLS and cpu.get(p, 0.0) >= 1.0:
+                rank = (cpu[p], d, st[3])
+                if best is None or rank > best[0]:
+                    best = (rank, p)
+                if prev and prev[0] == (p, st[3]):
+                    kept = (cpu[p], p)
+            for k in children.get(p, ()):
+                if k not in stop:
+                    parent_of[k] = p
+                    stack.append((k, d + 1))
+        if best is None:
+            if prev and now - prev[2] < HOLD:
+                return prev[1]
+            self.workers.pop(tkey, None)
+            return ""
+        w = kept[1] if kept and best[0][0] <= 2 * kept[0] else best[1]
+        wkey = (w, procs[w][3])
+        if prev and prev[0] == wkey:
+            prev[2] = now
+            return prev[1]
+        path, p = [w], w
+        while p != c and p in parent_of and len(path) < 16:
+            p = parent_of[p]
+            path.append(p)
+        path.reverse()
+        # Only what is below the command the row already describes.
+        below = path[path.index(cur) + 1:] if cur in path else path
+        said = text.lower()
+        labels = []
+        for p in below:
+            lbl = work_label(procs[p][0], self.args((p, procs[p][3])) if is_launcher(procs[p][0]) or procs[p][0] in SHELLS else [])
+            if lbl and (not labels or labels[-1] != lbl):
+                labels.append(lbl)
+        while labels and (labels[0] == prog or labels[0].lower() in said):
+            labels.pop(0)
+        chain = " › ".join(labels[-3:])
+        self.workers[tkey] = [wkey, chain, now]
+        return chain
 
     def agent_name(self, key, comm):
         base = comm.lower()
@@ -780,6 +862,7 @@ class Scanner:
                     "id": f"{c}-{procs[c][3]}",
                     "text": text,
                     "proc": prog,
+                    "chain": self.work_chain(c, cur, text, prog, procs, children, cpu, stop, now),
                     "started": int(BOOT + procs[c][3] / CLK),
                     "cpu": round(t_cpu, 1),
                     "mem": t_rss // (1024 * 1024),
@@ -794,7 +877,7 @@ class Scanner:
             for tid in list(seen):
                 if tid not in current:
                     t = dict(seen.pop(tid))
-                    t.update(cpu=0, mem=0, done=True, ended=int(now))
+                    t.update(cpu=0, mem=0, chain="", done=True, ended=int(now))
                     held.append((now + DONE_HOLD, t))
             self.done[akey] = held
             if not tasks and not held and "--managed-daemon" in self.args(akey):
@@ -818,7 +901,7 @@ class Scanner:
 
         # Forget caches for processes that are gone
         alive = {key(p) for p in procs}
-        for cache in (self.cmd, self.envc, self.desc, self.agent_info):
+        for cache in (self.cmd, self.envc, self.desc, self.agent_info, self.workers):
             for k in [k for k in cache if k not in alive]:
                 del cache[k]
         for k in [k for k in self.names if k[0] not in alive]:
