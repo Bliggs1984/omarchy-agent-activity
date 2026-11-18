@@ -324,6 +324,51 @@ class RunningNow(unittest.TestCase):
             self.assertEqual(scan.proc_label(text, prog), want, (text, prog))
 
 
+class WorkChain(unittest.TestCase):
+    def setUp(self):
+        # 10 claude's shell -> 11 python3 encode.py -> 12 ffmpeg, and 13 magick beside it
+        self.s = scan.Scanner()
+        self.argv = {10: claude("sed -i s/a/b/ x.txt && python3 encode.py"), 11: ["python3", "encode.py"],
+                     12: ["ffmpeg", "-i", "a.mp4", "b.mp4"], 13: ["magick", "a.png", "b.png"]}
+        comm = {10: "bash", 11: "python3", 12: "ffmpeg", 13: "magick"}
+        self.procs = {p: (comm[p], p - 1, 0, p, 0) for p in self.argv}
+        for p, a in self.argv.items():
+            self.s.cmd[(p, p)] = a
+        self.children = {10: [11], 11: [12, 13]}
+
+    def chain(self, cpu, now, cur=10, text="Editing files", prog=""):
+        return self.s.work_chain(10, cur, text, prog, self.procs, self.children, cpu, set(), now)
+
+    def test_names_the_script_and_the_busy_program(self):
+        self.assertEqual(self.chain({12: 30.0}, 0), "encode.py › ffmpeg")
+        # The row already describes the script: only what is under it.
+        s = scan.Scanner()
+        s.cmd = self.s.cmd
+        self.assertEqual(s.work_chain(10, 11, "Python script", "", self.procs, self.children, {12: 30.0}, set(), 0), "ffmpeg")
+        # Nothing busy underneath: no line.
+        self.assertEqual(scan.Scanner().work_chain(10, 10, "Editing files", "", self.procs, self.children, {12: 0.5}, set(), 0), "")
+
+    def test_holds_steady_while_the_work_goes_on(self):
+        self.assertEqual(self.chain({12: 20.0, 13: 15.0}, 0), "encode.py › ffmpeg")
+        self.assertEqual(self.chain({12: 12.0, 13: 18.0}, 2), "encode.py › ffmpeg")    # a little busier: stays
+        self.assertEqual(self.chain({12: 3.0, 13: 18.0}, 4), "encode.py › magick")     # far busier: moves
+        self.assertEqual(self.chain({}, 4 + scan.HOLD - 1), "encode.py › magick")      # quiet: held a while
+        self.assertEqual(self.chain({}, 4 + scan.HOLD + 1), "")
+
+    def test_labels(self):
+        for comm, args, want in [("python3", ["python3", "-u", "/x/tools/encode.py", "--fast"], "encode.py"),
+                                 ("python3", ["python3", "-m", "pytest", "-q"], "pytest"),
+                                 ("python3", ["python3", "-c", "print(1)"], "python3"),
+                                 ("node", ["node", "/usr/bin/npm", "run", "dev"], "npm"),
+                                 ("node", ["node", "-p", "SECRET.value", "app.js"], "node"),
+                                 ("node", ["node", "-r", "dotenv/config", "app.js"], "app.js"),
+                                 ("bash", ["bash", "-c", "ls"], None),
+                                 ("bash", ["bash", "scripts/deploy.sh"], "deploy.sh"),
+                                 ("aiwidget-3f9c2e", ["./aiwidget-3f9c2e1b7a6d5c4e"], "aiwidget"),
+                                 ("ffmpeg", [], "ffmpeg")]:
+            self.assertEqual(scan.work_label(comm, args), want, (comm, args))
+
+
 class MainLoop(unittest.TestCase):
     def test_survives_scan_errors(self):
         class Broken:

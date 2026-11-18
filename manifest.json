@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.bliggs1984.agent-activity",
   "name": "Agent Top",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": "Bliggs1984",
   "license": "MIT",
   "description": "Live view of the processes your AI agents have started: what each one is doing, which agent and session started it, and the CPU and memory it uses.",
