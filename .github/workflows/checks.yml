@@ -1,0 +1,36 @@
+# Runs the tests and Omarchy's plugin validator on every push to main and every pull request,
+# so a broken change shows up before it goes into a marketplace update request.
+name: Checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.x'
+
+      - name: Tests
+        run: python3 -m unittest discover -s tests -v
+
+      # The same script as `omarchy plugin validate` (bash + jq), pinned to a known commit of
+      # basecamp/omarchy so an upstream change can't alter or break this check without notice.
+      # To move to a newer validator, replace the commit below.
+      - name: Plugin validator
+        env:
+          OMARCHY_COMMIT: b7e900cedd0c98e843aba4ae3ec301172044238a
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/basecamp/omarchy/$OMARCHY_COMMIT/bin/omarchy-plugin-validate" -o "$RUNNER_TEMP/omarchy-plugin-validate"
+          bash "$RUNNER_TEMP/omarchy-plugin-validate" .
+          echo "manifest.json is valid"
