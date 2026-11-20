@@ -342,5 +342,66 @@ class MainLoop(unittest.TestCase):
         self.assertEqual(err.getvalue().count("RuntimeError: boom"), 1)
 
 
+class Caches(unittest.TestCase):
+    # Fake processes with pids above pid_max, so nothing real is read from /proc.
+    def run_scans(self, steps, env=None, connect=None):
+        """steps: one {pid: stat} per scan. Returns the Scanner and each scan's agents."""
+        s = scan.Scanner()
+        procs, snaps = {}, []
+        con = mock.MagicMock()
+        con.execute.return_value.fetchone.return_value = ("T" * 5000,)
+        with mock.patch.object(scan.os, "listdir", lambda p: [str(pid) for pid in procs]), \
+                mock.patch.object(scan, "read_stat", lambda pid: procs.get(pid)), \
+                mock.patch.object(scan, "owned", lambda pid: True), \
+                mock.patch.object(scan.sqlite3, "connect", connect or (lambda *a, **k: con)):
+            for step in steps:
+                procs.clear()
+                procs.update(step)
+                for pid, st in procs.items():
+                    s.cmd.setdefault((pid, st[3]), [st[0]])
+                    s.envc.setdefault((pid, st[3]), (env or {}).get(pid, {"T3CODE_THREAD_ID": "thread-%d" % pid}))
+                snaps.append(s.scan()["agents"])
+        return s, snaps
+
+    A = {9000001: ("claude", 1, 0, 11, 0)}
+    B = {9000002: ("claude", 1, 0, 22, 0)}
+
+    def test_titles_go_when_the_session_does(self):
+        s, snaps = self.run_scans([{**self.A, **self.B}, self.A, {}])
+        self.assertEqual([a["label"] for a in snaps[0]], ["T" * 80] * 2)     # masked and cut to what is shown
+        self.assertEqual(sorted(s.titles), [])
+        s, snaps = self.run_scans([{**self.A, **self.B}, self.A])
+        self.assertEqual(sorted(s.titles), ["thread-9000001"])
+
+    def test_failed_lookups_go_too(self):
+        def broken(*a, **k):
+            raise scan.sqlite3.OperationalError("unable to open database file")
+        s, snaps = self.run_scans([{**self.A, **self.B}, {}], connect=broken)
+        self.assertEqual(s.titles, {})
+
+    def test_stored_title_is_short_text(self):
+        con = mock.MagicMock()
+        with mock.patch.object(scan.sqlite3, "connect", lambda *a, **k: con):
+            con.execute.return_value.fetchone.return_value = ("token=sample123 " + "T" * 5000,)
+            title = scan.Scanner().thread_title("x")
+            self.assertEqual(len(title), 80)
+            self.assertNotIn("sample123", title)
+            con.execute.return_value.fetchone.return_value = (12345,)       # not text: no title, no crash
+            self.assertIsNone(scan.Scanner().thread_title("x"))
+
+    def test_one_name_per_process_however_often_it_renames(self):
+        steps = [{9000003: ("python%d" % i, 1, 0, 33, 0)} for i in range(50)]
+        s, _ = self.run_scans(steps)
+        self.assertEqual(len(s.names), 1)
+        s, _ = self.run_scans(steps + [{}])
+        self.assertEqual(s.names, {})
+
+    def test_bad_claude_pid_does_not_stop_the_scan(self):
+        orphans = {9000010: ("sleep", 1, 0, 40, 0), 9000011: ("sleep", 1, 0, 41, 0)}
+        env = {9000010: {"CLAUDE_PID": "\u00b2"}, 9000011: {"CLAUDE_PID": "9" * 5000}}
+        s, snaps = self.run_scans([{**self.A, **orphans}], env=env)
+        self.assertEqual(len(snaps[0]), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

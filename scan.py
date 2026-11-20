@@ -555,8 +555,8 @@ class Scanner:
         self.envc = {}          # (pid, start) -> env subset
         self.desc = {}          # (pid, start) -> description
         self.agent_info = {}    # (pid, start) -> dict(name, host, label, thread)
-        self.names = {}         # ((pid, start), comm) -> agent name or None, so each process is judged once
-        self.titles = {}        # thread id -> (title, fetched_at)
+        self.names = {}         # (pid, start) -> (comm, agent name or None), judged again when comm changes
+        self.titles = {}        # thread id -> (display title or None, fetched_at), for live sessions only
         self.done = {}          # agent key -> list of (expires, task dict)
         self.seen_tasks = {}    # agent key -> {task key: task dict}
 
@@ -574,7 +574,7 @@ class Scanner:
 
     def thread_title(self, tid):
         cached = self.titles.get(tid)
-        now = time.time()
+        now = time.monotonic()
         if cached and now - cached[1] < 60:
             return cached[0]
         title = None
@@ -586,8 +586,8 @@ class Scanner:
                         row = con.execute(f"select title from {table} where thread_id=?", (tid,)).fetchone()
                     except sqlite3.Error:
                         row = None
-                    if row and row[0]:
-                        title = row[0]
+                    if row and isinstance(row[0], str) and row[0]:
+                        title = redact(row[0])[:80]     # keep only what the panel shows
                         break
             finally:
                 con.close()
@@ -673,12 +673,12 @@ class Scanner:
         agents = {}
         for pid, (comm, _, _, _, _) in procs.items():
             if comm.lower() in AGENTS or is_launcher(comm):
-                nk = (key(pid), comm)       # comm is in the key: it changes when a process execs or renames itself
-                n = self.names.get(nk, 0)
-                if n == 0:
-                    n = self.names[nk] = self.agent_name(nk[0], comm) if owned(pid) else None
-                if n:
-                    agents[pid] = n
+                k = key(pid)
+                n = self.names.get(k)       # judged again when comm changes: the process exec'd or renamed itself
+                if n is None or n[0] != comm:
+                    n = self.names[k] = (comm, self.agent_name(k, comm) if owned(pid) else None)
+                if n[1]:
+                    agents[pid] = n[1]
 
         # Orphans that still carry CLAUDE_PID (backgrounded jobs whose parent shell exited)
         adopted = {}
@@ -689,9 +689,12 @@ class Scanner:
                     continue                          # agents, their helpers and daemons are not jobs
                 if ppid == 0 or pid == 1 or not owned(pid):
                     continue
-                cp = self.env(key(pid)).get("CLAUDE_PID", "")
-                if cp.isdigit() and int(cp) in live_claude:
-                    adopted.setdefault(int(cp), []).append(pid)
+                try:
+                    cp = int(self.env(key(pid)).get("CLAUDE_PID", ""))
+                except ValueError:
+                    continue                          # missing or not a number
+                if cp in live_claude:
+                    adopted.setdefault(cp, []).append(pid)
 
         def subtree(root, stop):
             total_cpu, total_rss, stack, n = 0.0, 0, [root], 0
@@ -742,7 +745,7 @@ class Scanner:
                     "thread": self.env(akey).get("T3CODE_THREAD_ID", ""),
                 }
             label = self.thread_title(info["thread"]) if info["thread"] else None
-            label = redact(label or info["folder"] or "")[:80]
+            label = label or redact(info["folder"] or "")[:80]
 
             a_cpu, a_rss, _ = subtree(apid, stop - {apid})
             tasks, mcps = [], []
@@ -818,14 +821,16 @@ class Scanner:
 
         # Forget caches for processes that are gone
         alive = {key(p) for p in procs}
-        for cache in (self.cmd, self.envc, self.desc, self.agent_info):
+        for cache in (self.cmd, self.envc, self.desc, self.agent_info, self.names):
             for k in [k for k in cache if k not in alive]:
                 del cache[k]
-        for k in [k for k in self.names if k[0] not in alive]:
-            del self.names[k]
         for k in [k for k in self.seen_tasks if k not in live_keys]:
             del self.seen_tasks[k]
             self.done.pop(k, None)
+        # Titles of T3 sessions that are no longer running, and failed lookups for them
+        threads = {self.agent_info[k]["thread"] for k in live_keys if k in self.agent_info}
+        for t in [t for t in self.titles if t not in threads]:
+            del self.titles[t]
 
         self.prev = {pid: (st[3], st[2]) for pid, st in procs.items()}
         self.prev_t = now
