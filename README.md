@@ -14,7 +14,8 @@ started, a short plain-English summary of it, and the CPU and memory it uses.
   Aider, Goose, Crush, Amp, Cursor Agent, Copilot CLI, Qwen Code, Droid and Grok
   CLI are recognised. A coloured dot glows brighter the harder the agent works.
   An agent that restarts itself or runs behind a wrapper (Gemini CLI, npm
-  installs) is shown as one block. Codex's background service is listed only
+  installs) is shown as one block. A command Codex runs inside its Linux sandbox
+  (`bwrap`) is shown as the command itself. Codex's background service is listed only
   while it is running a command, so its idle memory is not counted.
 - **Where it runs.** The app it runs in (T3 Code, a terminal, VS Code, Zed, tmux,
   ...), its project folder, and how long it has been running. For agents started

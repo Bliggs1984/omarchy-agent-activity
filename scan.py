@@ -132,7 +132,10 @@ def redact(text):
 # --------------------------------------------------------------------------
 _CLAUDE_EVAL = re.compile(r"\beval '((?:[^']|'\"'\"')*)'")
 _SKIP_WORDS = {"sudo", "env", "nice", "ionice", "time", "command", "exec", "builtin", "nohup", "stdbuf"}
-_WRAPPERS = _SKIP_WORDS | {"timeout"}       # programs whose job is to run another program
+# Programs whose job is to run another program. Codex runs each command inside
+# its sandbox: bwrap, then its own helper, re-run as codex-linux-sandbox.
+_SANDBOXES = {"bwrap", "codex-linux-sandbox"}
+_WRAPPERS = _SKIP_WORDS | {"timeout"} | _SANDBOXES
 _SETUP = re.compile(r"^(?:cd|export|source|\.|set|shopt|unset|unalias|trap|true|:|local|declare|ulimit|umask|pushd|popd|eval)$")
 
 
@@ -628,8 +631,10 @@ class Scanner:
     def helper(a, at):
         # Helper modes of an agent binary (MCP server, browser bridge), not a session.
         # Only the subcommand slot counts: "--mcp-config x" or "-p 'add an mcp tool'" are sessions.
-        # "codex app-server daemon ..." is the bookkeeping half of Codex's background service.
+        # "codex app-server daemon ..." is the bookkeeping half of Codex's background service,
+        # and codex-linux-sandbox is Codex's sandbox around one of its commands.
         return ("--chrome-native-host" in a or a[1:3] == ["app-server", "daemon"]
+                or bool(a) and _base(a[0]) in _SANDBOXES
                 or any(i < len(a) and a[i] in ("mcp", "mcp-server") for i in at))
 
     def current(self, pid, procs, children, agents):
@@ -689,6 +694,8 @@ class Scanner:
         said = text.lower()
         labels = []
         for p in below:
+            if _base(procs[p][0]) in _WRAPPERS:
+                continue                    # timeout, sudo, a sandbox: they only run the next program
             lbl = work_label(procs[p][0], self.args((p, procs[p][3])) if is_launcher(procs[p][0]) or procs[p][0] in SHELLS else [])
             if lbl and (not labels or labels[-1] != lbl):
                 labels.append(lbl)
@@ -813,7 +820,7 @@ class Scanner:
                 while p in procs and hops < 12 and not host:
                     c = procs[p][0]
                     for prefix, label in HOSTS:
-                        if c.startswith(prefix):
+                        if c.startswith(prefix) and c.lower() not in AGENTS:   # "codex" is not VS Code
                             host = label
                             break
                     p, hops = procs[p][1], hops + 1
@@ -835,8 +842,10 @@ class Scanner:
             current = set()
             own = [apid] + members.get(apid, [])
             orphans = {c for m in own for c in adopted.get(m, ())}
+            # The agent's own helper programs, such as codex-code-mode-host, are not tasks.
+            parts = tuple(procs[m][0].lower() + "-" for m in own if procs[m][0].lower() in AGENTS)
             for c in [c for m in own for c in children.get(m, ())] + sorted(orphans):
-                if c in agents or c not in procs:
+                if c in agents or c not in procs or parts and procs[c][0].lower().startswith(parts):
                     continue
                 ckey = key(c)
                 args = self.args(ckey)
