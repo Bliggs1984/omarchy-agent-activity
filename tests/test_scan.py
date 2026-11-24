@@ -451,6 +451,31 @@ class Caches(unittest.TestCase):
         s, snaps = self.run_scans([{**self.A, **orphans}], env=env)
         self.assertEqual(len(snaps[0]), 1)
 
+    def test_codex_sandbox_is_one_session(self):
+        # Codex runs each command in its sandbox: 9000031 codex -> 9000032 bwrap ->
+        # 9000033 codex re-run as codex-linux-sandbox -> 9000034 bash bench.sh -> 9000035 xz.
+        # Beside them, 9000036 is Codex's own code-mode host. And 9000037, a Claude Code
+        # that Codex started, runs in a terminal: "codex" is not VS Code.
+        tree = lambda ticks: {9000030: ("alacritty", 1, 0, 60, 0),
+                              9000031: ("codex", 9000030, 0, 61, 0),
+                              9000032: ("bwrap", 9000031, 0, 62, 0),
+                              9000033: ("codex", 9000032, 0, 63, 0),
+                              9000034: ("bash", 9000033, 0, 64, 0),
+                              9000035: ("xz", 9000034, ticks, 65, 0),
+                              9000036: ("codex-code-mode", 9000031, 0, 66, 0),
+                              9000037: ("claude", 9000031, 0, 67, 0)}
+        cmds = {9000031: ["codex"], 9000032: ["bwrap", "--unshare-pid", "--argv0", "codex"],
+                9000033: ["codex-linux-sandbox", "--sandbox-policy-cwd", "/w", "--", "bash", "bench.sh"],
+                9000034: ["bash", "bench.sh"], 9000035: ["xz", "-9"],
+                9000036: ["/opt/codex/bin/codex-code-mode-host", "--listen", "grpc+stdio://"],
+                9000037: ["claude"]}
+        _, snaps = self.run_scans([tree(0), tree(10 ** 6)], cmds=cmds, env={})
+        self.assertEqual(sorted(a["name"] for a in snaps[1]), ["Claude Code", "Codex"])
+        rows = {a["name"]: a for a in snaps[1]}
+        self.assertEqual(rows["Claude Code"]["host"], "Terminal")
+        tasks = rows["Codex"]["tasks"]
+        self.assertEqual([(t["text"], t["chain"]) for t in tasks], [("Running bench.sh", "xz")])
+
     def test_every_cache_empties_when_the_processes_go(self):
         # An agent running "python3 encode.py", which runs a busy ffmpeg, so the
         # task gets a "↳ encode.py › ffmpeg" line. Covers every cache, including
