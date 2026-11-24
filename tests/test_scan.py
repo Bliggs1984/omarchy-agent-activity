@@ -388,8 +388,12 @@ class MainLoop(unittest.TestCase):
 
 
 class Caches(unittest.TestCase):
+    # These guard the fixes the marketplace review accepted at 0d907c1
+    # (omacom/omarchy-plugin-marketplace#14916): nothing the scanner remembers may
+    # outlive the processes and sessions it is about, and stored titles are only
+    # the masked, 80-character text the panel shows.
     # Fake processes with pids above pid_max, so nothing real is read from /proc.
-    def run_scans(self, steps, env=None, connect=None):
+    def run_scans(self, steps, env=None, connect=None, cmds=None):
         """steps: one {pid: stat} per scan. Returns the Scanner and each scan's agents."""
         s = scan.Scanner()
         procs, snaps = {}, []
@@ -403,7 +407,7 @@ class Caches(unittest.TestCase):
                 procs.clear()
                 procs.update(step)
                 for pid, st in procs.items():
-                    s.cmd.setdefault((pid, st[3]), [st[0]])
+                    s.cmd.setdefault((pid, st[3]), (cmds or {}).get(pid, [st[0]]))
                     s.envc.setdefault((pid, st[3]), (env or {}).get(pid, {"T3CODE_THREAD_ID": "thread-%d" % pid}))
                 snaps.append(s.scan()["agents"])
         return s, snaps
@@ -446,6 +450,24 @@ class Caches(unittest.TestCase):
         env = {9000010: {"CLAUDE_PID": "\u00b2"}, 9000011: {"CLAUDE_PID": "9" * 5000}}
         s, snaps = self.run_scans([{**self.A, **orphans}], env=env)
         self.assertEqual(len(snaps[0]), 1)
+
+    def test_every_cache_empties_when_the_processes_go(self):
+        # An agent running "python3 encode.py", which runs a busy ffmpeg, so the
+        # task gets a "↳ encode.py › ffmpeg" line. Covers every cache, including
+        # any added later: each one must be empty once the processes are gone.
+        tree = lambda ticks: {**self.A,
+                              9000020: ("bash", 9000001, 0, 50, 0),
+                              9000021: ("python3", 9000020, 0, 51, 0),
+                              9000022: ("ffmpeg", 9000021, ticks, 52, 0)}
+        cmds = {9000020: claude("python3 encode.py"), 9000021: ["python3", "encode.py"],
+                9000022: ["ffmpeg", "-i", "a.mp4", "b.mp4"]}
+        s, snaps = self.run_scans([tree(0), tree(10 ** 6)], cmds=cmds)
+        self.assertIn("ffmpeg", snaps[1][0]["tasks"][0]["chain"])
+        self.assertTrue(s.workers)
+        s, _ = self.run_scans([tree(0), tree(10 ** 6), {}], cmds=cmds)
+        caches = {k: v for k, v in vars(s).items() if isinstance(v, dict)}
+        self.assertIn("workers", caches)
+        self.assertEqual({k: v for k, v in caches.items() if v}, {})
 
 
 if __name__ == "__main__":
